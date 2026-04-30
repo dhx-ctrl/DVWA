@@ -241,20 +241,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Remove stale output so a failed ZAP run does not leave old files
-          # that would be mistakenly imported into DefectDojo.
-          rm -f "${{ github.workspace }}/zap.xml" "${{ github.workspace }}/zap.html"
+          # ZAP runs as uid 1000 (zap) inside the container.  The host
+          # workspace is typically owned by root or the runner user, so
+          # mounting it directly at /zap/wrk causes:
+          #   PermissionError: [Errno 13] Permission denied: '/zap/wrk/zap.yaml'
+          # Fix: create a dedicated directory with open permissions.
+          ZAP_WORK_DIR="${RUN_OUTPUT_DIR}/zap_wrk"
+          rm -rf "$ZAP_WORK_DIR"
+          mkdir -p "$ZAP_WORK_DIR"
+          chmod 777 "$ZAP_WORK_DIR"
 
           docker pull ghcr.io/zaproxy/zaproxy:stable
           docker run --rm --network zapnet \
-            -v "${{ github.workspace }}:/zap/wrk:rw" \
+            -v "${ZAP_WORK_DIR}:/zap/wrk:rw" \
             ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
             -t "$APP_URL" \
             -x zap.xml \
             -r zap.html || true   # ZAP exits non-zero when findings exist; that's expected
 
-          test -s zap.xml
-          cp zap.xml "$RUN_OUTPUT_DIR/zap.xml"
+          if [[ ! -s "${ZAP_WORK_DIR}/zap.xml" ]]; then
+            echo "ERROR: ZAP did not produce zap.xml — check ZAP logs above"
+            ls -la "$ZAP_WORK_DIR"
+            exit 1
+          fi
+          cp "${ZAP_WORK_DIR}/zap.xml" "$RUN_OUTPUT_DIR/zap.xml"
           echo "zap.xml written ($(wc -c < "$RUN_OUTPUT_DIR/zap.xml") bytes)"
 
       - name: "Stop target app: ${{ env.APP_NAME }}"
