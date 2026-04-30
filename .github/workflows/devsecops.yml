@@ -206,15 +206,9 @@ jobs:
           docker pull "$DOCKER_IMAGE_NAME"
           docker rm -f "target-${APP_NAME}" 2>/dev/null || true
 
-          # Derive hostname from APP_URL; ports come from env vars.
+          # Derive hostname from APP_URL.
+          # APP_PORT and CONTAINER_PORT are set in the job env block.
           CONTAINER_HOST=$(python3 -c "from urllib.parse import urlparse; u=urlparse('$APP_URL'); print(u.hostname)")
-
-          # APP_PORT  = host-side port (for local access / debugging)
-          # CONTAINER_PORT = port the app listens on inside the container
-          # Default both from APP_URL if not explicitly set.
-          URL_PORT=$(python3 -c "from urllib.parse import urlparse; u=urlparse('$APP_URL'); print(u.port or 80)")
-          APP_PORT="${APP_PORT:-$URL_PORT}"
-          CONTAINER_PORT="${CONTAINER_PORT:-$URL_PORT}"
 
           # Use the hostname from APP_URL as a network alias so ZAP can
           # reach the container at the exact URL specified in APP_URL.
