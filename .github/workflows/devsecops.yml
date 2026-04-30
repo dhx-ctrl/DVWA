@@ -221,20 +221,50 @@ jobs:
 
           # Wait for the app to become ready.  The readiness check runs
           # inside the zapnet network (via curlimages/curl) because the
-          # host cannot resolve Docker network aliases like "juice-shop".
+          # host cannot resolve Docker network aliases like "dvwa".
           echo "Waiting for $APP_URL to become ready (checking from inside zapnet)..."
-          for i in {1..60}; do
-            if docker run --rm --network zapnet curlimages/curl \
-                 -sSf "$APP_URL" >/dev/null 2>&1; then
-              echo "$APP_NAME ready after ${i}×2s"
+          for i in {1..90}; do
+            HTTP_CODE=$(docker run --rm --network zapnet curlimages/curl \
+                 -sS -o /dev/null -w "%{http_code}" --max-time 5 "$APP_URL" 2>/dev/null) || HTTP_CODE="000"
+            if [[ "$HTTP_CODE" =~ ^(200|301|302)$ ]]; then
+              echo "$APP_NAME responded HTTP $HTTP_CODE after ${i}×2s"
               break
             fi
-            if [[ $i -eq 60 ]]; then
-              echo "ERROR: $APP_URL did not become ready within 120s"
+            if [[ $i -eq 90 ]]; then
+              echo "ERROR: $APP_URL did not become ready within 180s (last HTTP: $HTTP_CODE)"
+              docker logs "target-${APP_NAME}" 2>&1 | tail -30 || true
               exit 1
             fi
             sleep 2
           done
+
+      # ── DVWA: initialize the database ──────────────────────────────────────
+      # DVWA serves a setup page on first boot and won't function until you
+      # POST to /setup.php to create its MySQL tables.  Without this, ZAP
+      # gets null/error responses and crashes with "msg is null".
+      - name: "DVWA: initialize database"
+        if: env.ENABLE_ZAP == 'true' && env.DOCKER_IMAGE_NAME != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Initializing DVWA database via POST to ${APP_URL}/setup.php ..."
+          HTTP_CODE=$(docker run --rm --network zapnet curlimages/curl \
+            -sS -o /dev/null -w "%{http_code}" --max-time 15 \
+            -X POST "${APP_URL}/setup.php" \
+            -d "create_db=Create+%2F+Reset+Database" 2>/dev/null) || HTTP_CODE="000"
+          echo "DVWA setup responded HTTP $HTTP_CODE"
+
+          # Verify the login page is now reachable (DB tables exist).
+          sleep 3
+          HTTP_CODE=$(docker run --rm --network zapnet curlimages/curl \
+            -sS -o /dev/null -w "%{http_code}" --max-time 10 \
+            "${APP_URL}/login.php" 2>/dev/null) || HTTP_CODE="000"
+          if [[ "$HTTP_CODE" =~ ^(200|302)$ ]]; then
+            echo "DVWA login page reachable (HTTP $HTTP_CODE) — ready for ZAP"
+          else
+            echo "WARNING: DVWA login page returned HTTP $HTTP_CODE — ZAP may have issues"
+            docker logs "target-${APP_NAME}" 2>&1 | tail -20 || true
+          fi
 
       - name: "ZAP baseline scan -> zap.xml"
         if: env.ENABLE_ZAP == 'true'
@@ -252,6 +282,24 @@ jobs:
           chmod 777 "$ZAP_WORK_DIR"
 
           docker pull ghcr.io/zaproxy/zaproxy:stable
+
+          # Pre-flight: confirm the target is still reachable from zapnet.
+          # The image pull above can take minutes; the target may have crashed
+          # in the meantime.  ZAP gives an unhelpful "msg is null" error when
+          # the target is unreachable, so we catch it early with a clear message.
+          echo "Pre-flight: verifying $APP_URL is reachable from zapnet..."
+          PF_CODE=$(docker run --rm --network zapnet curlimages/curl \
+            -sS -o /dev/null -w "%{http_code}" --max-time 10 \
+            "$APP_URL" 2>/dev/null) || PF_CODE="000"
+          if [[ "$PF_CODE" == "000" ]]; then
+            echo "ERROR: $APP_URL is unreachable from zapnet (HTTP $PF_CODE)"
+            echo "Target container status:"
+            docker ps -a --filter "name=target-${APP_NAME}" --format "{{.Status}}" || true
+            docker logs "target-${APP_NAME}" 2>&1 | tail -30 || true
+            exit 1
+          fi
+          echo "Pre-flight OK — $APP_URL returned HTTP $PF_CODE"
+
           docker run --rm --network zapnet \
             -v "${ZAP_WORK_DIR}:/zap/wrk:rw" \
             ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
